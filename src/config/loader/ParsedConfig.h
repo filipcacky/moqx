@@ -623,6 +623,15 @@ struct ParsedLoggingConfig {
       qlog;
 };
 
+struct ParsedShutdownConfig {
+  rfl::Description<
+      "On SIGTERM/SIGINT, send GOAWAY to every client session, refuse new sessions, and "
+      "wait up to this many ms for sessions to close before force-closing the rest and exiting. "
+      "0 skips draining: no GOAWAY, immediate shutdown (default: 5000; at most 3600000)",
+      std::optional<uint64_t>>
+      drain_timeout_ms;
+};
+
 struct ParsedConfig {
   rfl::Description<"Listener definitions, keyed by listener name", ParsedListeners> listeners;
   rfl::Description<
@@ -659,6 +668,10 @@ struct ParsedConfig {
       mvfst_bpf_steering;
   rfl::Description<"Logging configuration", std::optional<ParsedLoggingConfig>> logging;
   rfl::Description<"MoQ Cluster settings", std::optional<ParsedClusterConfig>> cluster;
+  rfl::Description<
+      "Graceful shutdown (GOAWAY + drain) settings",
+      std::optional<ParsedShutdownConfig>>
+      shutdown;
 };
 
 } // namespace openmoq::moqx::config

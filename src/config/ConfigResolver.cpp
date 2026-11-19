@@ -1446,6 +1446,22 @@ folly::Expected<ResolvedConfig, std::string> resolveConfig(const ParsedConfig& c
     }
   }
 
+  // === Validate shutdown ===
+  ShutdownConfig shutdownConfig;
+  if (const auto& parsedShutdown = config.shutdown.value()) {
+    if (auto ms = parsedShutdown->drain_timeout_ms.value()) {
+      // The YAML reader wraps a negative into a huge uint64_t; the bound rejects it.
+      if (*ms > ShutdownConfig::kMaxDrainTimeoutMs) {
+        errors.push_back(
+            "shutdown.drain_timeout_ms must be <= " +
+            std::to_string(ShutdownConfig::kMaxDrainTimeoutMs) + " (0 = no drain)"
+        );
+      } else {
+        shutdownConfig.drainTimeout = std::chrono::milliseconds(*ms);
+      }
+    }
+  }
+
   if (!errors.empty()) {
     return folly::makeUnexpected("Config validation failed:\n  - " + folly::join("\n  - ", errors));
   }
@@ -1601,6 +1617,7 @@ folly::Expected<ResolvedConfig, std::string> resolveConfig(const ParsedConfig& c
               .mvfstBpfSteering = mvfstBpfSteering,
               .logging = std::move(loggingConfig),
               .cluster = cluster,
+              .shutdown = std::move(shutdownConfig),
           },
       .warnings = std::move(warnings),
   };

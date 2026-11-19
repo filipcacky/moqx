@@ -23,7 +23,7 @@
 namespace {
 using namespace openmoq::moqx::config;
 
-static_assert(rfl::internal::num_fields<Config> == 10, "Config changed — update serializeConfig()");
+static_assert(rfl::internal::num_fields<Config> == 11, "Config changed — update serializeConfig()");
 static_assert(
     rfl::internal::num_fields<ClusterConfig> == 1,
     "ClusterConfig changed — update serializeConfig()"
@@ -111,6 +111,10 @@ static_assert(
 static_assert(
     rfl::internal::num_fields<QLogConfig> == 2,
     "QLogConfig changed — update serializeLogging()"
+);
+static_assert(
+    rfl::internal::num_fields<ShutdownConfig> == 1,
+    "ShutdownConfig changed — update serializeConfig()"
 );
 
 // Sink that records every emitted scalar leaf as a flat path -> value map, so

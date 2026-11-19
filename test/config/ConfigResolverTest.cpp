@@ -2694,5 +2694,40 @@ TEST(ResolveConfig, PicoPathWarningsScopedToBoundServices) {
   }
 }
 
+TEST(ResolveConfig, ShutdownDefaults) {
+  auto result = resolveConfig(makeMinimalInsecureConfig());
+  ASSERT_TRUE(result.hasValue());
+  EXPECT_EQ(result.value().config.shutdown.drainTimeout, std::chrono::milliseconds(5000));
+}
+
+TEST(ResolveConfig, ShutdownExplicit) {
+  auto cfg = makeMinimalInsecureConfig();
+  ParsedShutdownConfig shutdown;
+  shutdown.drain_timeout_ms = std::optional<uint64_t>{0};
+  cfg.shutdown = std::optional<ParsedShutdownConfig>{shutdown};
+  auto result = resolveConfig(cfg);
+  ASSERT_TRUE(result.hasValue());
+  EXPECT_EQ(result.value().config.shutdown.drainTimeout, std::chrono::milliseconds(0));
+}
+
+TEST(ResolveConfig, ShutdownDrainTimeoutBound) {
+  auto cfg = makeMinimalInsecureConfig();
+  ParsedShutdownConfig shutdown;
+  shutdown.drain_timeout_ms = std::optional<uint64_t>{ShutdownConfig::kMaxDrainTimeoutMs};
+  cfg.shutdown = std::optional<ParsedShutdownConfig>{shutdown};
+  ASSERT_TRUE(resolveConfig(cfg).hasValue());
+
+  shutdown.drain_timeout_ms = std::optional<uint64_t>{ShutdownConfig::kMaxDrainTimeoutMs + 1};
+  cfg.shutdown = std::optional<ParsedShutdownConfig>{shutdown};
+  auto result = resolveConfig(cfg);
+  ASSERT_TRUE(result.hasError());
+  EXPECT_THAT(result.error(), HasSubstr("shutdown.drain_timeout_ms"));
+
+  // How the YAML reader delivers -1.
+  shutdown.drain_timeout_ms = std::optional<uint64_t>{static_cast<uint64_t>(-1)};
+  cfg.shutdown = std::optional<ParsedShutdownConfig>{shutdown};
+  EXPECT_TRUE(resolveConfig(cfg).hasError());
+}
+
 } // namespace
 } // namespace openmoq::moqx::config

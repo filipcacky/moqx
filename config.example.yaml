@@ -120,6 +120,9 @@ logging:                    # Logging configuration (optional)
     dir: "/tmp/moqx-qlog"          # Output directory; files named <cid_hex>.qlog (mvfst)
     sample_rate: 1.0       # Fraction of connections to log (0.0–1.0, default: 0.0; mvfst only)
 
+# shutdown:                   # Graceful shutdown on SIGTERM/SIGINT (optional)
+#   drain_timeout_ms: 5000    # GOAWAY all sessions, wait up to this long (max 3600000), then force-close (0 = no drain)
+
 # relay_id: "my-relay-1"     # Relay identity (optional; random hex string generated if absent)
 
 # cluster:                    # MoQ Cluster on draft 18+ relay links (optional)

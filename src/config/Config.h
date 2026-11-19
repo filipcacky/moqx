@@ -281,6 +281,12 @@ struct LoggingConfig {
   std::optional<QLogConfig> qlog;
 };
 
+struct ShutdownConfig {
+  static constexpr uint64_t kMaxDrainTimeoutMs = 60 * 60 * 1000; // 1 h
+  // 0 = no drain: no GOAWAY, shut down immediately.
+  std::chrono::milliseconds drainTimeout{5000};
+};
+
 struct Config {
   std::vector<ListenerConfig> listeners;
   folly::F14FastMap<std::string, ServiceConfig> services;
@@ -292,6 +298,7 @@ struct Config {
   bool mvfstBpfSteering{true};
   std::optional<LoggingConfig> logging;
   std::optional<ClusterConfig> cluster; // unset when MoQ Cluster is disabled
+  ShutdownConfig shutdown;
 };
 
 } // namespace openmoq::moqx::config

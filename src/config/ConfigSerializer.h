@@ -374,6 +374,10 @@ inline void serializeConfig(const Config& cfg, ConfigSink& s) {
     s.nullField("logging");
   }
 
+  s.beginObject("shutdown");
+  s.intField("drain_timeout_ms", cfg.shutdown.drainTimeout.count());
+  s.endObject();
+
   s.endObject();
 }
 

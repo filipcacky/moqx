@@ -92,4 +92,5 @@ TEST_HARNESS_UPSTREAMS_BASE=19830
 TEST_HARNESS_SIGHUP_BASE=19840
 TEST_HARNESS_CLUSTER_BASE=19850
 TEST_HARNESS_LISTENER_SERVICES_BASE=19860
-# Reserved for future harness tests through: 19879
+TEST_HARNESS_GOAWAY_BASE=19870
+# The harness block is now full: a new harness test needs a new block of ten.

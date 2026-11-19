@@ -67,8 +67,12 @@ ACTOR_GRACE = 2.0
 STARTUP_TIMEOUT = 5.0
 # Longer than the relay's own 10s teardown watchdog, so a relay that trips the
 # watchdog reports its _Exit(1) rather than being SIGKILLed here and blamed for
-# a hang it already diagnosed.
+# a hang it already diagnosed. The watchdog starts only after the drain, so a
+# relay's own wait is this plus its drain timeout (see _term_timeout).
 RELAY_TERM_TIMEOUT = 15.0
+# shutdown.drain_timeout_ms for relays that set none: short, so the SIGTERM at
+# every test's teardown does not sit out the relay's 5s default.
+DEFAULT_DRAIN_TIMEOUT_MS = 1000
 # The block each test claims in test_ports.sh.
 PORTS_PER_TEST = 10
 
@@ -354,6 +358,8 @@ class Relay:
     service_listeners: list[str] | None = None
     # Further service name -> the listeners it is bound to.
     extra_services: dict[str, list[str]] = field(default_factory=dict)
+    # The config's shutdown section; drain_timeout_ms defaults to DEFAULT_DRAIN_TIMEOUT_MS.
+    shutdown: dict = field(default_factory=dict)
     proc: subprocess.Popen | None = None
     config_path: Path | None = None
     log_path: Path | None = None
@@ -551,6 +557,7 @@ class Harness:
         listeners=None,
         service_listeners=None,
         extra_services=None,
+        shutdown=None,
     ):
         """Declare a relay.
 
@@ -562,6 +569,8 @@ class Harness:
         - service_listeners: binds the default service to these listeners only.
         - extra_services: service name -> listeners; each gets the default
           service's match rule, so only the binding tells them apart.
+        - shutdown: the config's shutdown section. drain_timeout_ms defaults
+          to DEFAULT_DRAIN_TIMEOUT_MS.
         """
         if self.started:
             raise HarnessError(f"relay {name}: declared after start()")
@@ -613,6 +622,7 @@ class Harness:
             listeners=dict(zip(names, ports)),
             service_listeners=bound if service_listeners is not None else None,
             extra_services=extra,
+            shutdown={"drain_timeout_ms": DEFAULT_DRAIN_TIMEOUT_MS, **(shutdown or {})},
         )
         self.relays[name] = entry
         return entry
@@ -693,6 +703,9 @@ class Harness:
         for name, listeners in relay.extra_services.items():
             parts.append(service(name, listeners))
         parts.append(_CONFIG_ADMIN.substitute(port=relay.admin))
+        parts.append("shutdown:\n")
+        for key, value in relay.shutdown.items():
+            parts.append(f"  {key}: {json.dumps(value)}\n")
         path = self.tmpdir / f"{relay.name}.yaml"
         path.write_text("".join(parts), encoding="utf-8")
         relay.config_path = path
@@ -1025,20 +1038,28 @@ class Harness:
         relay.proc.wait()
         relay.killed = True
 
-    def relay_stop(self, name):
+    @staticmethod
+    def _term_timeout(relay):
+        """How long a SIGTERMed relay may take: its drain, then the teardown watchdog."""
+        return relay.shutdown["drain_timeout_ms"] / 1000 + RELAY_TERM_TIMEOUT
+
+    def relay_stop(self, name, within=None):
         """SIGTERM a relay, wait for it, and assert it exited cleanly.
 
-        The graceful counterpart to relay_kill: the relay closes its sessions on
-        the way out, so peers notice at once rather than waiting out
-        idle_timeout_ms. The exit status is the assertion — a clean shutdown
-        path is the thing being tested.
+        The graceful counterpart to relay_kill: the relay sends GOAWAY, drains
+        for up to its drain_timeout_ms, then closes the remaining sessions, so
+        peers notice at once rather than waiting out idle_timeout_ms. The exit
+        status is the assertion — a clean shutdown path is the thing being
+        tested. `within`: seconds the relay must exit in, also asserted.
+        Returns the seconds it took, or None if it was not running.
         """
         relay = self.relay_of("relay_stop", name)
         if relay.proc is None or relay.killed or relay.stopped:
-            return
+            return None
+        started = time.monotonic()
         relay.proc.terminate()
         try:
-            status = relay.proc.wait(timeout=RELAY_TERM_TIMEOUT)
+            status = relay.proc.wait(timeout=self._term_timeout(relay))
         except subprocess.TimeoutExpired:
             # Not routed through _reap: it folds a hang into the same -9 a crash
             # would produce, and "hung in teardown" is the whole finding.
@@ -1046,19 +1067,30 @@ class Harness:
             relay.proc.wait()
             relay.stopped = True
             self._fail(
-                f"[{name}] relay did not exit within {RELAY_TERM_TIMEOUT:g}s of "
-                "SIGTERM — hung in teardown"
+                f"[{name}] relay did not exit within {self._term_timeout(relay):g}s "
+                "of SIGTERM — hung in drain or teardown"
             )
             self._dump_relay_log(name)
-            return
+            return None
+        elapsed = time.monotonic() - started
         relay.stopped = True
         if status == 0:
-            self._pass(f"[{name}] relay exited cleanly on SIGTERM")
+            self._pass(f"[{name}] relay exited cleanly on SIGTERM after {elapsed:.1f}s")
         else:
             self._fail(
                 f"[{name}] relay exited {status} on SIGTERM — crash or sanitizer leak"
             )
             self._dump_relay_log(name)
+        if within is not None:
+            if elapsed <= within:
+                self._pass(f"[{name}] exited within {within:g}s of SIGTERM")
+            else:
+                self._fail(
+                    f"[{name}] took {elapsed:.1f}s to exit after SIGTERM, "
+                    f"more than {within:g}s"
+                )
+                self._dump_relay_log(name)
+        return elapsed
 
     def relay_signal(self, name, signum):
         """Send a running relay <signum>. Asserts nothing: assert on what follows."""
@@ -1377,7 +1409,7 @@ class Harness:
 
         relay_failed = False
         for relay in relays:
-            status = _reap(relay.proc, RELAY_TERM_TIMEOUT)
+            status = _reap(relay.proc, self._term_timeout(relay))
             if status != 0:
                 print(
                     f"FAIL: relay {relay.name} exited {status} — crash, hang, "

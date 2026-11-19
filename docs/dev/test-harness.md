@@ -14,6 +14,7 @@ The existing tests are the best worked examples:
 | [`test/test_relay_pyramid.py`](/test/test_relay_pyramid.py) | tree | Multi-hop fan-out, killing a relay, containment |
 | [`test/test_relay_hops_cycle.py`](/test/test_relay_hops_cycle.py) | A → B → C → A | A cycle, and asserting on stability rather than an event |
 | [`test/test_listener_services.py`](/test/test_listener_services.py) | A ← B, four listeners on A | Services bound to some of a relay's listeners, identical rules on disjoint listeners |
+| [`test/test_relay_goaway.py`](/test/test_relay_goaway.py) | lone relays | `shutdown`, `relay_stop(within=)`, asserting on client output after SIGTERM |
 
 ## The shape of a test
 
@@ -70,7 +71,7 @@ sockets — badly enough that one relay's readiness check can pass against
 another test's relay:
 
 ```bash
-TEST_HARNESS_TEST_NAME_BASE=19870
+TEST_HARNESS_TEST_NAME_BASE=<next free block of ten>
 ```
 
 The variable name is derived from `base_port_key`: `test_name` becomes
@@ -80,7 +81,8 @@ missing variable if you forget.
 Ten ports are reserved per test. `h.relay()` hands out one port per listener
 plus one for admin, counting up from the base, so five one-listener relays fill
 the block. A topology that needs more raises a `HarnessError`. The block from
-`19800` is reserved for harness tests through `19879`. Do not write literal
+`19800` through `19879` is fully claimed; a new test needs a new block that
+collides with nothing else in the file. Do not write literal
 port numbers in comments in that file — the duplicate check greps every number
 in it.
 
@@ -147,6 +149,7 @@ h.relay(
     listeners=None,
     service_listeners=None,
     extra_services=None,
+    shutdown=None,
 )
 ```
 
@@ -156,7 +159,9 @@ declared *later*, so cycles work: `start()` brings every relay up before
 waiting for any of them to peer, and a relay whose upstream is not listening
 yet just reconnects with backoff. `upstreams` takes a list of such names.
 `relay_id` defaults to `<name>-test` and is the operational identity reported
-by `/state`.
+by `/state`. `shutdown` is the config's `shutdown` section; every relay gets
+`drain_timeout_ms: 1000` unless it sets its own, so the `SIGTERM` at teardown
+does not sit out the relay's 5 s default drain.
 
 `listeners` names the relay's listeners; the default is one, named after the
 relay. Actors that name no listener connect to the first. `service_listeners`
@@ -296,7 +301,7 @@ tail, the actor's output, the publishers on that namespace.
 | `expect_relay_id(name, want)` | `/state` `relay_id` |
 | `expect_metric(name, metric, op, want)` | A `moqx_*` Prometheus metric |
 | `expect_relay_alive(name)` | The relay process is still running |
-| `relay_stop(name)` | Doubles as an assertion: the relay exited 0 on `SIGTERM` |
+| `relay_stop(name, within=None)` | Doubles as an assertion: the relay exited 0 on `SIGTERM`, within `within` seconds if given |
 | `expect_settled(settle, *names)` | Every named relay's whole `namespace_tree` is unchanged over a `settle`-second window; defaults to all relays still up |
 
 `op` is one of `ge`, `gt`, `eq`, `lt`, `le`; both sides are compared as floats.
@@ -332,11 +337,14 @@ reaped it inside `relay_kill`; any such check would only be reading back a flag
 the same line just set.
 
 **`relay_stop`** models an operator restarting a relay. It `SIGTERM`s, waits up
-to 15s, and the exit status *is* the assertion. Three distinct failures surface
-here: a non-zero exit (a crash on the shutdown path, or a sanitizer leak
-report), and separately a process that never exits at all, reported as "hung in
-teardown" rather than as the `-9` the follow-up `SIGKILL` produces. Because the
-relay closes its sessions on the way out, the peer reacts immediately — this is
+to the relay's drain timeout plus 15s, and the exit status *is* the assertion.
+Three distinct failures surface here: a non-zero exit (a crash on the shutdown
+path, or a sanitizer leak report), and separately a process that never exits at
+all, reported as "hung in drain or teardown" rather than as the `-9` the
+follow-up `SIGKILL` produces. `within=` also fails a relay that exits cleanly
+but too late. The relay first sends GOAWAY to its sessions and drains (see
+[docs/config.md](/docs/config.md#shutdown)), then closes what remains, so the
+peer reacts immediately — this is
 what makes `expect_peer_count("A", "eq", 0)` a real assertion a second later.
 
 Note the limit of what it proves: the *process* exited cleanly. That peers were

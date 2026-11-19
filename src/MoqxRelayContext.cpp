@@ -279,7 +279,71 @@ void MoqxRelayContext::initThreadStatsCollectors(
   }
 }
 
+void MoqxRelayContext::startDrain(
+    const std::vector<folly::Executor::KeepAlive<folly::EventBase>>& ioEvbs,
+    std::chrono::milliseconds timeout,
+    folly::Function<void()> drainDone
+) {
+  drainDone_ = std::move(drainDone);
+  // One token per io thread, released once that thread has counted its sessions,
+  // so the count cannot reach zero before every thread has been visited.
+  openSessions_.store(static_cast<int64_t>(ioEvbs.size()), std::memory_order_relaxed);
+  draining_.store(true, std::memory_order_release);
+
+  // Posted, not waited on: a wedged io thread must not stall the drain timer.
+  const auto timeoutMs = static_cast<uint64_t>(timeout.count());
+  for (const auto& ka : ioEvbs) {
+    ka->runInEventBaseThread([this, timeoutMs] {
+      auto& local = *tlSessions_;
+      // Count before goaway()/close() can end a session, then count its end.
+      openSessions_.fetch_add(
+          static_cast<int64_t>(local.sessions.size()),
+          std::memory_order_acq_rel
+      );
+      local.counted = true;
+      // goaway() and close() can end a session inline, which erases it from the
+      // map; hold each one and walk a copy.
+      std::vector<std::pair<std::shared_ptr<MoQSession>, bool>> sessions;
+      sessions.reserve(local.sessions.size());
+      for (const auto& [session, established] : local.sessions) {
+        sessions.emplace_back(session->shared_from_this(), established);
+      }
+      size_t goaways = 0;
+      for (auto& [session, established] : sessions) {
+        if (!established) {
+          // Still in setup: SERVER_SETUP may not be out yet, so a GOAWAY now
+          // could reach the client first. Refuse it as a late arrival would be.
+          session->close(SessionCloseErrorCode::NO_ERROR);
+          continue;
+        }
+        // No New Session URI: the client reconnects to the URI it used.
+        session->goaway(Goaway{.timeout = timeoutMs});
+        ++goaways;
+      }
+      XLOG(INFO) << "Sent GOAWAY to " << goaways << " session(s), refused "
+                 << sessions.size() - goaways << " in setup, on this io thread";
+      if (openSessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        maybeFinishDrain();
+      }
+    });
+  }
+  maybeFinishDrain();
+}
+
+void MoqxRelayContext::maybeFinishDrain() {
+  if (!draining_.load(std::memory_order_acquire) ||
+      openSessions_.load(std::memory_order_acquire) != 0 ||
+      drainDoneFired_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  drainDone_();
+}
+
 void MoqxRelayContext::onNewSession(std::shared_ptr<MoQSession> clientSession) {
+  // Once draining, a new session is refused at setup; it must not hold the drain open.
+  if (!draining_.load(std::memory_order_acquire)) {
+    tlSessions_->sessions.emplace(clientSession.get(), false);
+  }
   auto& collector = *tlStatsCollector_;
   if (collector) {
     clientSession->setPublisherStatsCallback(collector->publisherCallback());
@@ -316,6 +380,12 @@ void MoqxRelayContext::onSessionEnd(
     const ListenerMatcher& listener,
     std::shared_ptr<MoQSession> session
 ) {
+  // Only a thread the drain has visited counts its sessions.
+  auto& local = *tlSessions_;
+  if (local.sessions.erase(session.get()) > 0 && local.counted &&
+      openSessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    maybeFinishDrain();
+  }
   if (auto& collector = *tlStatsCollector_) {
     collector->onSessionEnd();
   }
@@ -338,6 +408,12 @@ folly::Expected<folly::Unit, SessionCloseErrorCode> MoqxRelayContext::validateAu
     uint64_t /*negotiatedVersion*/,
     std::shared_ptr<MoQSession> session
 ) {
+  if (draining_.load(std::memory_order_acquire)) {
+    XLOG(INFO) << "Refusing new session on listener '" << listener.name()
+               << "': relay is shutting down";
+    return folly::makeUnexpected(SessionCloseErrorCode::NO_ERROR);
+  }
+
   // Match service by authority + path
   const auto& authority = session->getAuthority();
   const auto& path = session->getPath();
@@ -397,6 +473,10 @@ folly::Expected<folly::Unit, SessionCloseErrorCode> MoqxRelayContext::validateAu
   auto settings = session->getMoqSettings();
   settings.bufferingThresholds.perSubscription = config::subscriptionBufferBytes(entry.config);
   session->setMoqSettings(settings);
+  // SERVER_SETUP is queued on this call stack, so a GOAWAY from now on follows it.
+  if (auto it = tlSessions_->sessions.find(session.get()); it != tlSessions_->sessions.end()) {
+    it->second = true;
+  }
   return folly::unit;
 }
 

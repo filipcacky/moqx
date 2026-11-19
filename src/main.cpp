@@ -24,12 +24,15 @@
 #include <csignal>
 
 #include <chrono>
+#include <functional>
 #include <thread>
+#include <utility>
 
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/AsyncSignalHandler.h>
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/logging/Init.h>
 #include <folly/logging/xlog.h>
 
@@ -71,14 +74,30 @@ public:
     registerSignalHandler(SIGHUP);
   }
 
+  // Run on the first SIGTERM/SIGINT instead of stopping the loop, to drain
+  // gracefully. A second signal stops the loop at once.
+  void setDrainCallback(std::function<void()> drain) { drain_ = std::move(drain); }
+
   void signalReceived(int signum) noexcept override {
     if (signum == SIGHUP) {
       XLOG(WARNING) << "Ignoring SIGHUP: config reload is not supported, restart to apply changes";
       return;
     }
+    if (auto drain = std::exchange(drain_, nullptr)) {
+      XLOG(INFO) << "Received signal " << signum << ", draining (send again to stop now)";
+      try {
+        drain();
+        return;
+      } catch (const std::exception& ex) {
+        XLOG(ERR) << "Drain failed to start: " << ex.what();
+      }
+    }
     XLOG(INFO) << "Received signal " << signum << ", shutting down";
     getEventBase()->terminateLoopSoon();
   }
+
+private:
+  std::function<void()> drain_;
 };
 
 } // namespace
@@ -258,9 +277,34 @@ int main(int argc, char* argv[]) {
     XLOG(INFO) << "Admin server listening on " << config.admin->address.describe();
   }
 
+  // === 8a. Graceful shutdown ===
+  // First signal: GOAWAY to every session (new sessions are refused from then
+  // on), then stop the loop once all sessions close or the drain timeout
+  // passes. Sessions still open then are force-closed by server->stop() below.
+  // Nothing here waits on an io thread, so a wedged one cannot stall the timer.
+  const auto drainTimeout = config.shutdown.drainTimeout;
+  std::unique_ptr<folly::AsyncTimeout> drainTimer;
+  if (drainTimeout.count() > 0) {
+    signalHandler.setDrainCallback([&] {
+      XLOG(INFO) << "Sending GOAWAY, draining for up to " << drainTimeout.count() << "ms";
+      drainTimer = folly::AsyncTimeout::make(evb, [&]() noexcept {
+        XLOG(WARNING) << "Drain timeout (" << drainTimeout.count() << "ms) reached with "
+                      << context->openSessions() << " session(s) open, closing them";
+        evb.terminateLoopSoon();
+      });
+      drainTimer->scheduleTimeout(drainTimeout);
+      // drainDone runs on whichever io thread closes the last session.
+      context->startDrain(ioExecutor->getAllEventBases(), drainTimeout, [&evb] {
+        XLOG(INFO) << "Drain complete: all sessions closed";
+        evb.terminateLoopSoon();
+      });
+    });
+  }
+
   if (exitCode == 0) {
     evb.loopForever();
   }
+  drainTimer.reset();
 
   // Hard shutdown watchdog: if teardown hangs, force-exit after 10 seconds.
   std::thread([relayID = config.relayID] {
@@ -286,8 +330,7 @@ int main(int argc, char* argv[]) {
   // TODO: close listeners
 
   // === 10. Drain in-flight requests ===
-  // TODO: wait with timeout for active work to finish
-  // Timeout on drain -- don't wait forever for graceful shutdown
+  // Done before the loop exits: see 8a.
 
   // === 11. Shut down dependencies ===
   // TODO: TBD

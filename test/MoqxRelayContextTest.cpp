@@ -10,6 +10,7 @@
 #include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include <folly/synchronization/Baton.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <moxygen/test/MockMoQSession.h>
@@ -435,6 +436,151 @@ TEST_F(MoqxRelayContextTest, UnreadableUpstreamCACertFailsStartup) {
           testing::HasSubstr("upstream.tls.ca_cert: cannot load /nonexistent/ca.pem")
       )
   );
+}
+
+// --- shutdown drain ---
+
+// Records the GOAWAYs the drain sends.
+class GoawaySession : public NiceMock<test::MockMoQSession> {
+public:
+  using NiceMock<test::MockMoQSession>::NiceMock;
+  void goaway(Goaway goaway) override { goaways.push_back(std::move(goaway)); }
+  std::vector<Goaway> goaways;
+};
+
+std::shared_ptr<GoawaySession> makeGoawaySession(std::shared_ptr<MoQExecutor> exec) {
+  auto session = std::make_shared<GoawaySession>(std::move(exec));
+  session->setAuthority("live.example.com");
+  return session;
+}
+
+// The drain tests run without a relay thread: onSessionEnd() would post to it, and
+// the post could outlive the context the test destroys right after.
+// Starts a drain whose only io thread is the test's own, and lets it visit.
+void drainOnTestThread(MoqxRelayContext& ctx, folly::EventBase& evb, int& done) {
+  ctx.startDrain({folly::getKeepAliveToken(&evb)}, std::chrono::seconds(5), [&done] { ++done; });
+  evb.loopOnce(EVLOOP_NONBLOCK);
+}
+
+TEST_F(MoqxRelayContextTest, Drain_NoSessionsFinishesAtOnce) {
+  MoqxRelayContext ctx(
+      {{"svc", makeService("live.example.com")}},
+      "test-relay",
+      /*useRelayThread=*/false
+  );
+  int done = 0;
+  drainOnTestThread(ctx, evb_, done);
+  EXPECT_EQ(done, 1);
+}
+
+TEST_F(MoqxRelayContextTest, Drain_FinishesWhenLastSessionEnds) {
+  MoqxRelayContext ctx(
+      {{"svc", makeService("live.example.com")}},
+      "test-relay",
+      /*useRelayThread=*/false
+  );
+  auto listener = ctx.listenerMatcher(kListener);
+  auto s1 = makeSession(exec_, "live.example.com");
+  auto s2 = makeSession(exec_, "live.example.com");
+  ctx.onNewSession(s1);
+  ctx.onNewSession(s2);
+
+  int done = 0;
+  drainOnTestThread(ctx, evb_, done);
+  EXPECT_EQ(done, 0);
+  ctx.onSessionEnd(listener, s1);
+  EXPECT_EQ(done, 0);
+  EXPECT_EQ(ctx.openSessions(), 1);
+  ctx.onSessionEnd(listener, s2);
+  EXPECT_EQ(done, 1);
+}
+
+TEST_F(MoqxRelayContextTest, Drain_RefusesAndDoesNotWaitForNewSessions) {
+  MoqxRelayContext ctx(
+      {{"svc", makeService("live.example.com")}},
+      "test-relay",
+      /*useRelayThread=*/false
+  );
+  auto listener = ctx.listenerMatcher(kListener);
+  auto open = makeSession(exec_, "live.example.com");
+  ctx.onNewSession(open);
+  int done = 0;
+  drainOnTestThread(ctx, evb_, done);
+
+  auto late = makeSession(exec_, "live.example.com");
+  ctx.onNewSession(late);
+  EXPECT_EQ(ctx.openSessions(), 1);
+  auto result = ctx.validateAuthority(listener, emptySetup_, anyVersion_, late);
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(result.error(), SessionCloseErrorCode::NO_ERROR);
+
+  // The late session ending neither underflows the count nor finishes the drain.
+  ctx.onSessionEnd(listener, late);
+  EXPECT_EQ(ctx.openSessions(), 1);
+  EXPECT_EQ(done, 0);
+  ctx.onSessionEnd(listener, open);
+  EXPECT_EQ(done, 1);
+}
+
+// A thread the drain has not reached yet holds the drain open, sessions or not.
+TEST_F(MoqxRelayContextTest, Drain_WaitsForEveryIoThread) {
+  MoqxRelayContext ctx(
+      {{"svc", makeService("live.example.com")}},
+      "test-relay",
+      /*useRelayThread=*/false
+  );
+  folly::ScopedEventBaseThread other;
+  folly::Baton<> release;
+  other.getEventBase()->runInEventBaseThread([&] { release.wait(); });
+
+  int done = 0;
+  ctx.startDrain(
+      {folly::getKeepAliveToken(&evb_), folly::getKeepAliveToken(other.getEventBase())},
+      std::chrono::seconds(5),
+      [&] { ++done; }
+  );
+  evb_.loopOnce(EVLOOP_NONBLOCK);
+  EXPECT_EQ(done, 0);
+  release.post();
+  other.getEventBase()->runInEventBaseThreadAndWait([] {});
+  EXPECT_EQ(done, 1);
+}
+
+TEST_F(MoqxRelayContextTest, Drain_GoawayOnlyToSetUpSessions) {
+  MoqxRelayContext ctx(
+      {{"svc", makeService("live.example.com")}},
+      "test-relay",
+      /*useRelayThread=*/false
+  );
+  auto listener = ctx.listenerMatcher(kListener);
+  folly::ScopedEventBaseThread io;
+  auto* ioEvb = io.getEventBase();
+  auto ioExec = std::make_shared<MoQFollyExecutorImpl>(ioEvb);
+
+  // The registry is per io thread, so register on the one the drain will visit.
+  auto setUp = makeGoawaySession(ioExec);
+  auto inSetup = makeGoawaySession(ioExec);
+  ioEvb->runInEventBaseThreadAndWait([&] {
+    ctx.onNewSession(setUp);
+    ctx.onNewSession(inSetup);
+    ASSERT_TRUE(ctx.validateAuthority(listener, emptySetup_, anyVersion_, setUp).hasValue());
+  });
+
+  ctx.startDrain({folly::getKeepAliveToken(ioEvb)}, std::chrono::milliseconds(3000), [] {});
+  ioEvb->runInEventBaseThreadAndWait([] {});
+
+  ASSERT_EQ(setUp->goaways.size(), 1u);
+  // No New Session URI: the client reconnects to the one it used.
+  EXPECT_TRUE(setUp->goaways[0].newSessionUri.empty());
+  EXPECT_EQ(setUp->goaways[0].timeout, 3000u);
+  // Still in setup: closed rather than sent a GOAWAY ahead of SERVER_SETUP.
+  EXPECT_TRUE(inSetup->goaways.empty());
+
+  ioEvb->runInEventBaseThreadAndWait([&] {
+    for (auto& s : {setUp, inSetup}) {
+      ctx.onSessionEnd(listener, s);
+    }
+  });
 }
 
 } // namespace

@@ -46,6 +46,9 @@ services:                  # required; at least one
 
 admin:                     # optional; omit to disable the admin server
   { ... }
+
+shutdown:                  # optional; graceful shutdown (GOAWAY + drain)
+  { ... }
 ```
 
 **Duplicate keys** in any YAML mapping (two map-form listeners or two services
@@ -683,6 +686,52 @@ Prometheus a series set that reshuffles between scrapes.  See [docs/metrics.md] 
 | `GET` | `/metrics` | Prometheus-format metrics. See [docs/metrics.md](metrics.md) (pending PR #137). |
 | `GET` | `/metrics/track` | Per-track Prometheus metrics for live tracks. See [docs/metrics.md](metrics.md). |
 | `GET` | `/state` | Relay state: connected peers, active subscriptions, namespace tree, and cache stats. Always `Transfer-Encoding: chunked`, streamed as the walk produces it. Per-subscription counters are ingress-side (`total_groups_received`, `total_objects_received`, `largest`), counted on the relay executor; for subscriber counts use `moqx_track_subscribers` from `/metrics/track`. |
+
+---
+
+## Shutdown
+
+On the first `SIGTERM` or `SIGINT` the relay drains before it exits:
+
+1. It sends GOAWAY to every client session that has finished setup, on every
+   listener and every MOQT version. The GOAWAY carries no New Session URI, so
+   clients reconnect to the URI they used: take the relay out of DNS or the load
+   balancer before the drain if they must land elsewhere. On draft 18+ it carries
+   `drain_timeout_ms` as its timeout. Sessions still in setup are closed with
+   `NO_ERROR`.
+2. It refuses new sessions from then on. Listeners keep accepting connections:
+   the client completes the QUIC/TLS handshake (and on draft 18+ receives
+   SERVER_SETUP), then the relay closes the session with `NO_ERROR` when its
+   CLIENT_SETUP arrives. These sessions do not hold the drain open.
+3. Each session closes once its last request ends. On draft 18+ the peer must not
+   open new requests on it, and moxygen rejects any that it does. Draft 16 only
+   says the peer SHOULD NOT; a request that arrives anyway is served only if the
+   relay can answer it without a new request of its own (a join to a live track
+   or a cache hit), since the relay's sessions to publishers are draining too.
+4. The relay exits once every session has closed, or when `drain_timeout_ms`
+   passes. At that point it force-closes the sessions still open.
+
+A second `SIGTERM`/`SIGINT` skips the rest of the drain and shuts down at once.
+The admin server keeps answering throughout the drain.
+
+```yaml
+shutdown:
+  drain_timeout_ms: 5000  # default 5000; 0 = no GOAWAY, stop at once
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `shutdown.drain_timeout_ms` | `5000` | The longest the relay waits for sessions to close after GOAWAY, at most `3600000` (1 h). `0` turns draining off: no GOAWAY is sent and the relay shuts down at once. |
+
+**Relay links.** A moqx relay that dialed this relay (an `upstream`) only logs
+the GOAWAY and ignores its New Session URI. Its new requests on that link fail
+with `GOING_AWAY` until this relay closes the session. It then re-dials the same
+URI, backing off while the dial is refused. This relay's own dialed links get no
+GOAWAY and close at teardown.
+
+After the loop exits, a 10 s watchdog bounds the rest of teardown. A process
+supervisor's stop grace period (for example `docker stop -t`) must cover
+`drain_timeout_ms` plus that 10 s.
 
 ---
 

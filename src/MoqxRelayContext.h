@@ -6,7 +6,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <memory>
+#include <string>
 #include <string_view>
 
 #include "MoqxRelay.h"
@@ -21,6 +24,7 @@
 #include <moxygen/MoQSession.h>
 
 #include <folly/Expected.h>
+#include <folly/Function.h>
 #include <folly/ThreadLocal.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/Task.h>
@@ -145,6 +149,23 @@ public:
   // Stops the peering backends' own threads. Call after drainExecs().
   void join();
 
+  // Graceful shutdown. Marks the relay draining: sessions that arrive from now on
+  // are not tracked and are refused at CLIENT_SETUP. Then posts, without waiting,
+  // one task per io thread that sends GOAWAY (no New Session URI) to each
+  // session set up there and closes those still in setup; moxygen's
+  // MoQSession::goaway() closes a session once its last request ends. drainDone
+  // runs once, on any thread, when the last tracked session ends, or at once if
+  // none is open. Call once, from outside the io threads.
+  void startDrain(
+      const std::vector<folly::Executor::KeepAlive<folly::EventBase>>& ioEvbs,
+      std::chrono::milliseconds timeout,
+      folly::Function<void()> drainDone
+  );
+
+  // Client sessions the drain still waits for, plus one per io thread it has not
+  // reached yet. Meaningful only while draining. Any thread.
+  int64_t openSessions() const { return openSessions_.load(std::memory_order_relaxed); }
+
   enum class PurgeError { ServiceRequired, UnknownService };
 
   // Force-evicts one service's tracks matching ftn or ns, or all of them when
@@ -219,6 +240,23 @@ private:
   // One collector per io thread; tlStatsCollector_ binds each to its own thread.
   std::vector<std::shared_ptr<stats::MoQStatsCollector>> statsCollectors_;
   folly::ThreadLocal<std::shared_ptr<stats::MoQStatsCollector>> tlStatsCollector_;
+  // Client sessions accepted on each io thread, touched only from that thread.
+  // A session is added in onNewSession and removed in onSessionEnd, which
+  // MoQServerBase::handleClientSession pairs on the session's own thread.
+  struct ThreadSessions {
+    // Value: the session has passed validateAuthority.
+    folly::F14FastMap<moxygen::MoQSession*, bool> sessions;
+    bool counted{false}; // the drain has added sessions to openSessions_
+  };
+  folly::ThreadLocal<ThreadSessions> tlSessions_;
+  // Shutdown drain state, untouched until the drain starts so the session path
+  // writes no shared state. Atomics because io threads and the main thread meet here.
+  std::atomic<bool> draining_{false};
+  std::atomic<int64_t> openSessions_{0};
+  std::atomic<bool> drainDoneFired_{false};
+  // Set before draining_ (release), read after it (acquire).
+  folly::Function<void()> drainDone_;
+  void maybeFinishDrain();
   folly::EventBase* workerEvb_{nullptr};
 };
 

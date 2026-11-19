@@ -1,0 +1,1 @@
+- **Breaking:** `SIGTERM`/`SIGINT` now drains instead of stopping at once: the relay sends GOAWAY to every client session, refuses new ones, and exits once they close or [`shutdown.drain_timeout_ms`](/docs/config.md#shutdown) (default 5 s) passes, force-closing what remains. Set `drain_timeout_ms: 0` for the old immediate stop. A second signal stops at once.

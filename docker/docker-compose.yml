@@ -29,6 +29,9 @@ services:
     container_name: moqx
     image: ghcr.io/openmoq/moqx:latest
     restart: unless-stopped
+    # SIGTERM drains for up to shutdown.drain_timeout_ms (default 5s), then the
+    # teardown watchdog allows 10s more; Docker's 10s default would SIGKILL early.
+    stop_grace_period: ${MOQX_STOP_GRACE:-20s}
     # Resource allocation for the relay (env-overridable). Defaults suit the CI
     # load-test runner: 8 cores + generous memory. On smaller hosts a cpus value
     # above the core count is a no-op, and the memory limit is far above the

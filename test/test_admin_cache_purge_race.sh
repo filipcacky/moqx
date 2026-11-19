@@ -104,7 +104,11 @@ evict_stale_relay() {
   if [[ -n "$pids" ]]; then
     echo "Killing stale process(es) on admin port $ADMIN_PORT: $pids"
     kill $pids 2>/dev/null || true
-    sleep 0.3
+    # SIGTERM drains (up to the relay's drain_timeout_ms) before the port frees.
+    local deadline=$(( $(date +%s) + 20 ))
+    while lsof -ti TCP:"$ADMIN_PORT" >/dev/null 2>&1 && (( $(date +%s) < deadline )); do
+      sleep 0.2
+    done
   fi
 }
 

@@ -109,7 +109,9 @@ GLOG_TIME = re.compile(r"^[IWEF](\d\d)(\d\d) (\d\d):(\d\d):(\d\d(?:\.\d+)?)")
 # A fatal line further than this before the exit did not stop the relay
 # (DFATAL logs at F but only aborts in debug builds).
 FATAL_WINDOW = 10  # seconds
-SHUTDOWN = re.compile(r"Received signal (\d+), shutting down")
+# The first SIGTERM/SIGINT logs "draining"; a second, or one with draining off,
+# logs "shutting down".
+SHUTDOWN = re.compile(r"Received signal (\d+), (?:shutting down|draining)")
 GDB_FRAME = re.compile(r"^#\d+\s+(?:0x[0-9a-f]+ in )?(.+)$")
 
 GDB_COMMANDS = [
